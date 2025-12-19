@@ -13,6 +13,11 @@ pub mod models;
 
 mod macros;
 
+#[cfg(feature = "responses")]
+mod generated {
+    openai_sdk_codegen::generate!("../openapi.documented.yaml");
+}
+
 #[derive(Debug, Snafu)]
 pub enum OpenAIError {
     #[snafu(transparent)]

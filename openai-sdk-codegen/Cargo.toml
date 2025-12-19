@@ -1,0 +1,16 @@
+[package]
+name = "openai-sdk-codegen"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+convert_case = "0.10.0"
+openapiv3 = "2.2.0"
+proc-macro2 = "1.0.103"
+quote = "1.0.42"
+serde_yaml = "0.9.34"
+snafu = "0.8.9"
+syn = { version = "2.0.111", default-features = false }
