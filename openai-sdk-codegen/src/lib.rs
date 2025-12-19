@@ -272,25 +272,29 @@ fn expand_object(
     outputs: &mut Vec<proc_macro2::TokenStream>,
     object: &ObjectType,
     ident: &Ident,
-    mut struct_attrs: Vec<TokenStream>,
+    struct_attrs: Vec<TokenStream>,
 ) -> Result<(), Error> {
-    let mut fields: Vec<proc_macro2::TokenStream> = vec![];
+    struct Field<'a> {
+        name: &'a str,
+        r#type: Cow<'a, str>,
+        nullable: bool,
+        serializer: Option<&'static str>,
+        attrs: Vec<TokenStream>,
+    }
 
-    for (prop_name, prop) in &object.properties {
-        let field_name = format_field_name(prop_name);
+    let mut fields = vec![];
 
+    for (field_name, prop) in &object.properties {
         match prop {
-            ReferenceOr::Reference { reference } => {
-                let name = parse_reference(reference)?;
-
-                let field_type = syn::parse_str::<syn::Type>(name)?;
-
-                fields.push(quote! {
-                    pub #field_name: #field_type
-                });
-            }
+            ReferenceOr::Reference { reference } => fields.push(Field {
+                name: field_name,
+                r#type: Cow::Borrowed(parse_reference(reference)?),
+                nullable: false,
+                serializer: None,
+                attrs: vec![],
+            }),
             ReferenceOr::Item(item) => {
-                let mut field_attrs = build_schema_doc(item);
+                let field_attrs = build_schema_doc(item);
 
                 let is_timestamp =
                     matches!(&item.schema_data.description, Some(x) if x.contains("timestamp"));
@@ -312,41 +316,71 @@ fn expand_object(
                     _ => None,
                 };
 
-                if is_timestamp && matches!(&item.schema_kind, SchemaKind::Type(Type::Integer(_))) {
-                    let mut serializer = Cow::Borrowed("serde_with::TimestampSeconds<i64>");
-                    if item.schema_data.nullable {
-                        serializer = Cow::Owned(format!("Option<{serializer}>"));
-                    }
+                let serializer = if is_timestamp
+                    && matches!(&item.schema_kind, SchemaKind::Type(Type::Integer(_)))
+                {
+                    Some("serde_with::TimestampSeconds<i64>")
+                } else {
+                    None
+                };
 
-                    let with = format!("::serde_with::As::<{serializer}>");
-
-                    struct_attrs.push(quote! {
-                        #[serde_with::serde_as]
-                    });
-                    field_attrs.push(quote! {
-                        #[serde(with = #with)]
-                    });
-                }
+                // TODO: else expand struct
 
                 if let Some(field_type) = field_type {
-                    let field_type = if item.schema_data.nullable {
-                        Cow::Owned(format!("Option<{field_type}>"))
-                    } else {
-                        Cow::Borrowed(field_type)
-                    };
-
-                    let field_type = parse_str::<syn::Type>(&field_type)?;
-
-                    fields.push(quote! {
-                        #(#field_attrs)*
-                        pub #field_name: #field_type
-                    });
+                    fields.push(Field {
+                        name: field_name,
+                        r#type: Cow::Borrowed(field_type),
+                        nullable: item.schema_data.nullable,
+                        serializer,
+                        attrs: field_attrs,
+                    })
                 }
             }
         }
 
         // expand_schema(outputs, components, prop_name, reference_or_deref(prop))?;
     }
+
+    fields.iter_mut().for_each(|field| {
+        let required = object.required.iter().any(|x| x == field.name);
+        field.nullable = field.nullable || !required;
+    });
+
+    let fields = fields
+        .into_iter()
+        .map(|field| {
+            let field_type = if field.nullable {
+                Cow::Owned(format!("Option<{}>", field.r#type))
+            } else {
+                field.r#type
+            };
+
+            let serializer = field.serializer.map(|serializer| {
+                if field.nullable {
+                    Cow::Owned(format!("Option<{serializer}>"))
+                } else {
+                    Cow::Borrowed(serializer)
+                }
+            });
+
+            let field_name = format_field_name(field.name);
+            let field_type = parse_str::<syn::Type>(&field_type)?;
+
+            let mut field_attrs = field.attrs.clone();
+
+            if let Some(serializer) = serializer {
+                let with = format!("::serde_with::As::<{serializer}>");
+                field_attrs.push(quote! {
+                    #[serde(with = #with)]
+                });
+            }
+
+            syn::Result::Ok(quote! {
+                #(#field_attrs)*
+                pub #field_name: #field_type
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let struct_quote = quote! {
         #(#struct_attrs)*
