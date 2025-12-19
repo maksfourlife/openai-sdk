@@ -79,7 +79,7 @@ fn try_generate(lit: &Lit) -> Result<TokenStream, Error> {
 }
 
 fn expand_schema(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     nullable: &mut HashSet<String>,
     _components: &Components,
     schema_name: &str,
@@ -109,14 +109,14 @@ fn expand_schema(
             _ => {}
         },
         SchemaKind::AnyOf { any_of } => {
-            expand_any_of(outputs, nullable, schema_name, &ident, any_of)?;
+            expand_any_of(outputs, nullable, schema_name, doc, any_of)?;
         }
         SchemaKind::AllOf { all_of } => {
             expand_all_of(outputs, &ident, all_of)?;
         }
         SchemaKind::Any(any) => {
             if !any.any_of.is_empty() {
-                expand_any_of(outputs, nullable, schema_name, &ident, &any.any_of)?;
+                expand_any_of(outputs, nullable, schema_name, doc, &any.any_of)?;
             }
         }
         _ => {}
@@ -126,9 +126,9 @@ fn expand_schema(
 }
 
 fn expand_string(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     ident: &Ident,
-    doc: &[proc_macro2::TokenStream],
+    doc: &[TokenStream],
     string: &StringType,
 ) -> Result<(), Error> {
     let variants: Vec<_> = string
@@ -136,7 +136,7 @@ fn expand_string(
         .iter()
         .filter_map(|x| {
             x.as_ref().map(|x| {
-                let ident = format_ident!("{}", format_variant_name(x));
+                let ident = format_variant_name(x);
                 quote! {
                     #[serde(rename = #x)]
                     #ident
@@ -157,11 +157,11 @@ fn expand_string(
 }
 
 fn expand_array(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     nullable: &mut HashSet<String>,
     _components: &Components,
     ident: &Ident,
-    doc: &[proc_macro2::TokenStream],
+    doc: &[TokenStream],
     array: &ArrayType,
 ) -> Result<(), Error> {
     if let Some(items) = &array.items {
@@ -189,10 +189,10 @@ fn expand_array(
 }
 
 fn expand_any_of(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     nullable: &mut HashSet<String>,
     schema_name: &str,
-    ident: &Ident,
+    mut attrs: Vec<TokenStream>,
     any_of: &[ReferenceOr<Schema>],
 ) -> Result<(), Error> {
     let mut variants = vec![];
@@ -203,6 +203,24 @@ fn expand_any_of(
                 if is_null_object(item) {
                     nullable.insert(schema_name.to_string());
                     continue;
+                }
+
+                if let SchemaKind::Type(Type::String(string)) = &item.schema_kind
+                    && !string.enumeration.is_empty()
+                {
+                    attrs.extend(build_schema_doc(item));
+
+                    string
+                        .enumeration
+                        .iter()
+                        .filter_map(|x| x.as_deref())
+                        .for_each(|name| {
+                            let ident = format_variant_name(name);
+                            variants.push(quote! {
+                                #[serde(rename = #name)]
+                                #ident
+                            });
+                        });
                 }
 
                 // expand_schema(outputs, nullable, _components, schema_name, item)?;
@@ -221,7 +239,10 @@ fn expand_any_of(
         }
     }
 
+    let ident = format_ident!("{}", format_struct_name(schema_name));
+
     outputs.push(quote! {
+        #(#attrs)*
         #[derive(Debug, ::serde::Deserialize, ::serde::Serialize)]
         pub enum #ident {
             #(#variants,)*
@@ -232,7 +253,7 @@ fn expand_any_of(
 }
 
 fn expand_all_of(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     ident: &Ident,
     all_of: &[ReferenceOr<Schema>],
 ) -> Result<(), Error> {
@@ -269,7 +290,7 @@ fn expand_all_of(
 }
 
 fn expand_object(
-    outputs: &mut Vec<proc_macro2::TokenStream>,
+    outputs: &mut Vec<TokenStream>,
     object: &ObjectType,
     ident: &Ident,
     struct_attrs: Vec<TokenStream>,
@@ -395,7 +416,7 @@ fn expand_object(
     Ok(())
 }
 
-fn build_schema_doc(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
+fn build_schema_doc(schema: &Schema) -> Vec<TokenStream> {
     let mut doc = vec![];
 
     if let Some(title) = schema.schema_data.title.as_deref() {
@@ -420,7 +441,7 @@ fn format_struct_name(value: &str) -> String {
     value.replace('-', "_")
 }
 
-fn format_variant_name(value: &str) -> String {
+fn format_variant_name(value: &str) -> Ident {
     let mut value = value
         .split('.')
         .map(|part| {
@@ -434,7 +455,7 @@ fn format_variant_name(value: &str) -> String {
     if value.starts_with(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']) {
         value = format!("_{value}");
     }
-    value
+    format_ident!("{value}")
 }
 
 fn format_field_name(value: &str) -> Ident {
@@ -543,6 +564,50 @@ mod test {
                 ApiKey_Created,
                 #[serde(rename = "api_key.updated")]
                 ApiKey_Updated,
+            }
+        };
+
+        assert_eq!(outputs[0].to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_expand_service_tier() {
+        let yaml = r##"
+            anyOf:
+                - type: string
+                  enum:
+                        - auto
+                        - default
+                        - flex
+                        - scale
+                        - priority
+                  default: auto
+                - type: "null"
+        "##;
+        let schema = serde_yaml::from_str::<Schema>(yaml).unwrap();
+
+        let SchemaKind::AnyOf { any_of } = &schema.schema_kind else {
+            panic!();
+        };
+
+        let mut outputs = vec![];
+        let mut nullable = HashSet::new();
+
+        expand_any_of(&mut outputs, &mut nullable, "ServiceTier", vec![], any_of).unwrap();
+
+        let expected = quote! {
+            #[derive(Debug, ::serde::Deserialize, ::serde::Serialize)]
+            pub enum ServiceTier {
+                #[serde(rename = "auto")]
+                Auto,
+                #[serde(rename = "default")]
+                Default,
+                #[serde(rename = "flex")]
+                Flex,
+                #[serde(rename = "scale")]
+                Scale,
+                #[serde(rename = "priority")]
+                Priority,
             }
         };
 
